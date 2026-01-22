@@ -1,6 +1,4 @@
-using namespace System.Net
-
-Function Invoke-ExecAlertsList {
+function Invoke-ExecAlertsList {
     <#
     .FUNCTIONALITY
         Entrypoint
@@ -9,12 +7,6 @@ Function Invoke-ExecAlertsList {
     #>
     [CmdletBinding()]
     param($Request, $TriggerMetadata)
-
-    $APIName = $Request.Params.CIPPEndpoint
-    $Headers = $Request.Headers
-    Write-LogMessage -headers $Headers -API $APIName -message 'Accessed this API' -Sev 'Debug'
-
-
     function New-FlatArray ([Array]$arr) {
         $arr | ForEach-Object {
             if ($_ -is 'Array') {
@@ -43,6 +35,10 @@ Function Invoke-ExecAlertsList {
             }
 
             $DisplayableAlerts = New-FlatArray $AlertsObj | Where-Object { $null -ne $_.Id } | Sort-Object -Property EventDateTime -Descending
+            if (!$DisplayableAlerts) {
+                $DisplayableAlerts = @()
+            }
+            $Metadata = [PSCustomObject]@{}
 
             [PSCustomObject]@{
                 NewAlertsCount             = $DisplayableAlerts | Where-Object { $_.Status -eq 'newAlert' } | Measure-Object | Select-Object -ExpandProperty Count
@@ -51,7 +47,7 @@ Function Invoke-ExecAlertsList {
                 SeverityMediumAlertsCount  = $DisplayableAlerts | Where-Object { ($_.Status -eq 'inProgress') -or ($_.Status -eq 'newAlert') } | Where-Object { $_.Severity -eq 'medium' } | Measure-Object | Select-Object -ExpandProperty Count
                 SeverityLowAlertsCount     = $DisplayableAlerts | Where-Object { ($_.Status -eq 'inProgress') -or ($_.Status -eq 'newAlert') } | Where-Object { $_.Severity -eq 'low' } | Measure-Object | Select-Object -ExpandProperty Count
                 SeverityInformationalCount = $DisplayableAlerts | Where-Object { ($_.Status -eq 'inProgress') -or ($_.Status -eq 'newAlert') } | Where-Object { $_.Severity -eq 'informational' } | Measure-Object | Select-Object -ExpandProperty Count
-                MSResults                  = $DisplayableAlerts
+                MSResults                  = @($DisplayableAlerts)
             }
         } else {
             $Table = Get-CIPPTable -TableName cachealertsandincidents
@@ -59,14 +55,12 @@ Function Invoke-ExecAlertsList {
             $Filter = "PartitionKey eq '$PartitionKey'"
             $Rows = Get-CIPPAzDataTableEntity @Table -filter $Filter | Where-Object -Property Timestamp -GT (Get-Date).AddMinutes(-30)
             $QueueReference = '{0}-{1}' -f $TenantFilter, $PartitionKey
-            $RunningQueue = Invoke-ListCippQueue | Where-Object { $_.Reference -eq $QueueReference -and $_.Status -notmatch 'Completed' -and $_.Status -notmatch 'Failed' }
+            $RunningQueue = Invoke-ListCippQueue -Reference $QueueReference | Where-Object { $_.Status -notmatch 'Completed' -and $_.Status -notmatch 'Failed' }
             # If a queue is running, we will not start a new one
             if ($RunningQueue) {
                 $Metadata = [PSCustomObject]@{
                     QueueMessage = 'Still loading data for all tenants. Please check back in a few more minutes'
-                }
-                [PSCustomObject]@{
-                    Waiting = $true
+                    QueueId      = $RunningQueue.RowKey
                 }
             } elseif (!$Rows -and !$RunningQueue) {
                 # If no rows are found and no queue is running, we will start a new one
@@ -74,6 +68,7 @@ Function Invoke-ExecAlertsList {
                 $Queue = New-CippQueueEntry -Name 'Alerts List - All Tenants' -Reference $QueueReference -TotalTasks ($TenantList | Measure-Object).Count
                 $Metadata = [PSCustomObject]@{
                     QueueMessage = 'Loading data for all tenants. Please check back in a few minutes'
+                    QueueId      = $Queue.RowKey
                 }
                 $InputObject = [PSCustomObject]@{
                     OrchestratorName = 'AlertsOrchestrator'
@@ -87,12 +82,12 @@ Function Invoke-ExecAlertsList {
                     }
                     SkipLog          = $true
                 } | ConvertTo-Json -Depth 10
-                $InstanceId = Start-NewOrchestration -FunctionName CIPPOrchestrator -InputObject $InputObject
-                [PSCustomObject]@{
-                    Waiting    = $true
-                    InstanceId = $InstanceId
-                }
+                Start-NewOrchestration -FunctionName CIPPOrchestrator -InputObject $InputObject
             } else {
+                $Metadata = [PSCustomObject]@{
+                    QueueId = $RunningQueue.RowKey ?? $null
+                }
+
                 $Alerts = $Rows
                 $AlertsObj = foreach ($Alert in $Alerts) {
                     $AlertInfo = $Alert.Alert | ConvertFrom-Json
@@ -133,7 +128,7 @@ Function Invoke-ExecAlertsList {
             Metadata = $Metadata
         }
     }
-    Push-OutputBinding -Name Response -Value ([HttpResponseContext]@{
+    return ([HttpResponseContext]@{
             StatusCode = $StatusCode
             Body       = $Body
         })
